@@ -1,116 +1,147 @@
 import pandas as pd
-import numpy as np
+import psycopg2
 import json
-from sqlalchemy import create_engine
 from datetime import datetime, timedelta
 
-# 最新交易日判断函数
-def get_latest_trade_day():
-    now = datetime.now()
-    hour = now.hour
-    today = now.date()
-    weekday = today.weekday()
+# 数据库配置
+db_config = {
+    "host": "25.tcp.cpolar.top",
+    "port": 11324,
+    "database": "stock",
+    "user": "postgres",
+    "password": "123456"
+}
 
-    if weekday >= 5:  # 周六日
-        offset = (weekday - 4) if weekday != 6 else 2
-        return pd.to_datetime(today - timedelta(days=offset))
-    if weekday == 0 and hour < 18:
-        return pd.to_datetime(today - timedelta(days=3))
-    if hour < 18:
-        return pd.to_datetime(today - timedelta(days=1))
-    return pd.to_datetime(today)
-
-# PostgreSQL 数据库配置
-engine = create_engine("postgresql+psycopg2://postgres:123456@25.tcp.cpolar.top:11324/stock")
-OUTPUT_PATH = "macd_latest_buy_signals.json"
-
-# MACD计算
-def calc_macd(df):
-    df['EMA12'] = df['close'].ewm(span=12, adjust=False).mean()
-    df['EMA26'] = df['close'].ewm(span=26, adjust=False).mean()
-    df['DIF'] = df['EMA12'] - df['EMA26']
-    df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
-    df['MACD'] = 2 * (df['DIF'] - df['DEA'])
-    df['signal'] = 0
-    df.loc[(df['DIF'] > df['DEA']) & (df['DIF'].shift(1) <= df['DEA'].shift(1)), 'signal'] = 1
+def calculate_macd(df):
+    df = df.sort_values('trade_date')
+    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+    df['dif'] = df['ema12'] - df['ema26']
+    df['dea'] = df['dif'].ewm(span=9, adjust=False).mean()
+    df['macd'] = 2 * (df['dif'] - df['dea'])
+    df['buy'] = ((df['dif'] > df['dea']) & (df['dif'].shift(1) <= df['dea'].shift(1))).astype(int)
     return df
 
-# 从数据库读取数据
-def get_stock_data(ts_code):
-    sql = f"""
+def fetch_stock_codes(conn):
+    sql = "SELECT DISTINCT ts_code FROM all_stocks_days"
+    return pd.read_sql(sql, conn)['ts_code'].tolist()
+
+def fetch_stock_data(conn, ts_code):
+    sql = """
         SELECT ts_code, trade_date, open, high, low, close, pre_close, pct_chg,
                vol, bay, ma120, ma250, name
         FROM all_stocks_days
-        WHERE ts_code = '{ts_code}'
-        ORDER BY trade_date ASC
+        WHERE ts_code = %s
+        ORDER BY trade_date
     """
-    df = pd.read_sql(sql, engine)
-    df['trade_date'] = pd.to_datetime(df['trade_date'])
+    return pd.read_sql(sql, conn, params=(ts_code,))
+
+def apply_stop_logic(df, profit_thresh=0.05, loss_thresh=-0.03):
+    df['sell'] = 0.0
+    buy_indices = df.index[df['buy'] == 1].tolist()
+    for buy_idx in buy_indices:
+        buy_price = df.at[buy_idx, 'close']
+        for future_idx in range(buy_idx + 1, len(df)):
+            current_price = df.at[future_idx, 'close']
+            rate = (current_price - buy_price) / buy_price
+            if rate >= profit_thresh or rate <= loss_thresh:
+                df.at[future_idx, 'sell'] = current_price
+                break
     return df
 
-# 提取前后窗口
-def extract_window(df, center_index, before=20, after=20):
-    start = max(center_index - before, 0)
-    end = min(center_index + after + 1, len(df))
-    return df.iloc[start:end]
+def get_latest_trade_day():
+    now = datetime.now()
+    today = now.date()
+    hour = now.hour
+    weekday = today.weekday()
+    if weekday == 5: return today - timedelta(days=1)
+    if weekday == 6: return today - timedelta(days=2)
+    if weekday == 0 and hour < 18: return today - timedelta(days=3)
+    if hour < 18: return today - timedelta(days=1)
+    return today
 
-# 主流程
+def process_stock(conn, ts_code):
+    df = fetch_stock_data(conn, ts_code)
+    if df.empty or len(df) < 35:
+        return None, None
+    df = calculate_macd(df)
+    df = apply_stop_logic(df)
+    df['bay'] = df['pre_close'].where(df['buy'] == 1, 0)
+
+    # 判断是否在最新交易日有买点
+    latest_trade_day_str = get_latest_trade_day().strftime('%Y%m%d')
+    latest_row = df[df['trade_date'] == latest_trade_day_str]
+    if latest_row.empty or latest_row['buy'].iloc[0] ==0:
+        return None, None
+
+    # 提取最近20天的数据
+    latest_data = df.tail(20).copy()
+    data = latest_data[[
+        "ts_code", "trade_date", "open", "high", "low", "close", "pre_close", "pct_chg",
+        "vol", "bay", "ma120", "ma250", "name", "sell"
+    ]].values.tolist()
+
+    # 平均收益率
+    profits = []
+    for idx in df.index[df['buy'] == 1]:
+        buy_price = df.at[idx, 'close']
+        for j in range(idx + 1, len(df)):
+            sell_price = df.at[j, 'sell']
+            if sell_price != 0:
+                profits.append((sell_price - buy_price) / buy_price)
+                break
+    avg_profit = round(sum(profits) / len(profits), 4) if profits else 0.0
+
+    return [data], {"ts_code": ts_code, "avg_profit": avg_profit}
+
 def main():
+    print("🚀 正在连接数据库...")
+    conn = psycopg2.connect(**db_config)
+    print("✅ 数据库连接成功")
+
     column_names = [
         "ts_code", "trade_date", "open", "high", "low", "close", "pre_close", "pct_chg",
-        "vol", "bay", "ma120", "ma250", "name"
+        "vol", "bay", "ma120", "ma250", "name", "sell"
     ]
-    grid_data = []
+    strategy_scores = []
+    stock_count = 0
+    has_written = False  # 👈 用于控制逗号输出
 
-    # 从本地文件读取股票列表
-    stock_codes = pd.read_csv("stock_list.txt", header=None)[0].tolist()
-    today_date = get_latest_trade_day()
-    print("自动识别最新交易日为：", today_date.strftime('%Y-%m-%d'))
+    with open("macd_result.json", "w", encoding='utf-8') as f:
+        f.write('{\n')
+        f.write('"column_names": ' + json.dumps(column_names, ensure_ascii=False) + ',\n')
+        f.write('"data": [\n')
 
-    for ts_code in stock_codes:
-        try:
-            df = get_stock_data(ts_code)
-            if len(df) < 41:
-                continue
+        ts_codes = fetch_stock_codes(conn)
+        total = len(ts_codes)
+        print(f"📈 共找到 {total} 支股票，开始处理")
 
-            df = calc_macd(df)
+        for idx, ts_code in enumerate(ts_codes):
+            print(f"[{idx+1}/{total}] 正在处理：{ts_code}", end="")
+            stock_data, score_info = process_stock(conn, ts_code)
+            if stock_data:
+                if has_written:
+                    f.write(',\n')
+                json.dump(stock_data[0], f, ensure_ascii=False)
+                stock_count += 1
+                has_written = True
+                print(" ✅ 写入成功")
+                if score_info:
+                    print(f"  ↳ 平均收益率: {score_info['avg_profit']*100:.2f}%")
+            else:
+                print(" ❌ 未写入（无买点）")
+            if score_info:
+                strategy_scores.append(score_info)
 
-            # 只处理包含最新交易日的股票
-            today_row = df[df['trade_date'] == today_date]
-            if today_row.empty:
-                continue
+        f.write('\n],\n')
+        f.write(f'"stock_count": {stock_count}\n')
+        f.write('}')
 
-            idx = today_row.index[0]
-            if df.at[idx, 'signal'] != 1:
-                continue
+    conn.close()
 
-            window_df = extract_window(df, idx, before=20, after=20)
+    print("\n📊 策略表现前 10（按平均收益率）:")
+    for rank, item in enumerate(sorted(strategy_scores, key=lambda x: x['avg_profit'], reverse=True)[:10], start=1):
+        print(f"{rank}. {item['ts_code']} - 平均收益率: {item['avg_profit']*100:.2f}%")
 
-            records = window_df[column_names].copy()
-            records['trade_date'] = records['trade_date'].dt.strftime('%Y-%m-%d')
-            data_list = records.values.tolist()
-
-            # 添加预测卖点占位
-            last_row = data_list[-1].copy()
-            last_row[1] = "预测卖点日期"
-            last_row[9] = "预测卖出价"
-            data_list.append(last_row)
-
-            grid_data.append(data_list)
-
-        except Exception as e:
-            print(f"{ts_code} 处理失败：{e}")
-            continue
-
-    output = {
-        "column_names": column_names,
-        "grid_data": grid_data
-    }
-
-    with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
-
-    print(f"\n✅ 已完成，共 {len(grid_data)} 支股票今日出现金叉，结果写入 {OUTPUT_PATH}")
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

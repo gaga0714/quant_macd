@@ -1,0 +1,7 @@
+{
+"column_names": ["ts_code", "trade_date", "open", "high", "low", "close", "pre_close", "pct_chg", "vol", "bay", "ma120", "ma250", "name", "sell"],
+"data": [
+
+],
+"stock_count": 0
+}
