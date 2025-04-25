@@ -60,7 +60,7 @@ def fetch_stock_data(engine, ts_code):
     return pd.read_sql(sql, engine, params=(ts_code,))
 
 # 止盈止损策略
-def apply_stop_logic(df, profit_thresh=0.05, loss_thresh=-0.03):
+def apply_stop_logic(df, profit_thresh=0.02, loss_thresh=-0.01):
     # 添加卖点 0未卖出
     df['sell'] = 0.0
     # 找出所有卖点的索引
@@ -117,7 +117,7 @@ def process_stock(engine, ts_code):
         return None, None
 
     # 提取最近20天的数据
-    latest_data = df.tail(20).copy()
+    latest_data = df.tail(80).copy()
     data = latest_data[[
         "ts_code", "trade_date", "open", "high", "low", "close", "pre_close", "pct_chg",
         "vol", "bay", "ma120", "ma250", "name", "sell"
@@ -151,8 +151,10 @@ def process_stock(engine, ts_code):
 #             print(f"👉 日期：{row['trade_date']}，收盘价：{row['close']:.2f}")
 
 def main():
+    today_str = datetime.now().strftime("%Y%m%d")
+    filename = f"macd_{today_str}.json"
     print("正在连接数据库...")
-    engine = create_engine("postgresql+psycopg2://postgres:123456@25.tcp.cpolar.top:11324/stock")
+    engine = create_engine("postgresql+psycopg2://postgres:123456@15858739883.gnway.cc:31731/stock")
 
     print("数据库连接成功")
     # print_buy_signals(conn, "000001.SZ")
@@ -165,7 +167,7 @@ def main():
     stock_count = 0
     has_written = False  # 用于控制逗号输出
 
-    with open("macd_result.json", "w", encoding='utf-8') as f:
+    with open(filename, "w", encoding='utf-8') as f:
         f.write('{\n')
         f.write('"column_names": ' + json.dumps(column_names, ensure_ascii=False) + ',\n')
         f.write('"data": [\n')

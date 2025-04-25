@@ -6,7 +6,7 @@ CORS(app)
 
 @app.route('/macd')
 def get_macd_result():
-    with open('macd_result.json', 'r', encoding='utf-8') as f:
+    with open('macd_20250424.json', 'r', encoding='utf-8') as f:
         data = json.load(f)
     return jsonify(data)
 
